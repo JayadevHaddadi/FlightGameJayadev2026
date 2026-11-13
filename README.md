@@ -2,7 +2,9 @@
 
 A minimal browser flight game made with Three.js. You fly a futuristic plane around a planet with no gravity and no friction. Collect stars between tall neon cities, drift with the brake, and fly around the planet forever.
 
-## Run
+**Play it:** https://jayadevhaddadi.github.io/FlightGameJayadev2026/
+
+## Run locally
 
 ```bash
 python3 -m http.server 8000
