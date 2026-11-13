@@ -1,0 +1,561 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Zero-G Flight</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; font-family: system-ui, sans-serif; color: #cfe8ff; }
+  #hud { position: fixed; left: 16px; top: 16px; font-size: 14px; line-height: 1.6; text-shadow: 0 0 4px #000; pointer-events: none; }
+  #boost { width: 200px; height: 10px; border: 1px solid #6cf; margin-top: 2px; }
+  #boostFill { height: 100%; width: 100%; background: #4cf; }
+  #help { position: fixed; right: 16px; bottom: 16px; font-size: 12px; opacity: .75; text-align: right; line-height: 1.6; pointer-events: none; }
+  #flash { position: fixed; left: 50%; top: 30%; transform: translateX(-50%); font-size: 32px; color: #ffd84a; opacity: 0; transition: opacity .4s; pointer-events: none; text-shadow: 0 0 12px #fa0; }
+  #drift { color: #f6c; }
+  #musicBtn { position: fixed; right: 16px; top: 16px; z-index: 10; background: rgba(10,20,40,.7); color: #cfe8ff; border: 1px solid #6cf; border-radius: 6px; padding: 6px 12px; font: inherit; font-size: 13px; cursor: pointer; }
+  #start { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 28px; background: rgba(0,0,20,.45); cursor: pointer; letter-spacing: 2px; }
+</style>
+</head>
+<body>
+<div id="hud">
+  ★ Stars: <b id="stars">0</b> / <span id="starsTotal"></span><br>
+  Speed: <span id="spd">0</span> <span id="drift"></span><br>
+  Altitude: <span id="alt">0</span><br>
+  Laps around planet: <span id="lap">0</span><br>
+  BOOST
+  <div id="boost"><div id="boostFill"></div></div>
+</div>
+<div id="flash">+1 ★</div>
+<div id="help">
+  Mouse — steer (yaw + pitch)<br>
+  W — thrust · S — reverse<br>
+  Space — hard brake / drift (uses boost)<br>
+  Shift — boost (5 s, recharges)<br>
+  Q / E — knife-edge left/right · double-tap — barrel roll<br>
+  M — music on/off · Esc — release mouse
+</div>
+<button id="musicBtn">♪ Music: ON</button>
+<div id="start">Click to fly</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+<script type="module">
+import * as THREE from 'three';
+
+// ---------- Tuning ----------
+const R = 5000;              // planet radius -> circumference ~31.4k units
+// No top speed: thrust keeps adding speed forever (~150 = 3.5 min per lap)
+const ACCEL = 70;            // thrust acceleration (W)
+const REVERSE_ACCEL = 50;    // reverse thrust (S)
+const BOOST_ACCEL = 200;     // extra acceleration while boosting (Shift)
+const BRAKE_EXP = 2.2;       // Space: speed *= e^(-BRAKE_EXP*dt) -> ~halves in 0.3 s
+const BRAKE_LIN = 40;        // plus a constant decel so it reaches a full stop
+const BRAKE_TURN_MULT = 2;   // nose swings faster while braking (drift)
+const MOUSE_SENS = 0.0025;   // rad per pixel
+const KEY_TURN = 1.8;        // rad/s yaw for A/D fallback
+const MAX_PITCH = THREE.MathUtils.degToRad(85);
+const FUEL_MAX = 5;          // seconds of boost/brake
+const FUEL_REGEN = FUEL_MAX / 5; // full refill in 5 s
+const MIN_ALT = 4, MAX_ALT = 3000;
+
+// ---------- Renderer / scene ----------
+const renderer = new THREE.WebGLRenderer({ antialias: true, logarithmicDepthBuffer: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x02030a);
+scene.fog = new THREE.FogExp2(0x0a1030, 0.00035);
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.5, 60000);
+
+scene.add(new THREE.AmbientLight(0x6070a0, 0.8));
+const sun = new THREE.DirectionalLight(0xffeedd, 1.8);
+sun.position.set(1, 0.6, 0.3).multiplyScalar(20000);
+scene.add(sun);
+
+const rand = (a, b) => a + Math.random() * (b - a);
+function randUnit() {
+  const u = rand(-1, 1), t = rand(0, Math.PI * 2), s = Math.sqrt(1 - u * u);
+  return new THREE.Vector3(s * Math.cos(t), u, s * Math.sin(t));
+}
+// point on unit sphere at roughly `dist` world units from center direction n
+function scatter(n, dist) {
+  const t = randUnit(); t.addScaledVector(n, -t.dot(n)).normalize();
+  return n.clone().multiplyScalar(R).addScaledVector(t, dist).normalize();
+}
+
+// ---------- Planet ----------
+function gridTexture() {
+  const c = document.createElement('canvas'); c.width = c.height = 256;
+  const g = c.getContext('2d');
+  g.fillStyle = '#161d33'; g.fillRect(0, 0, 256, 256);
+  for (let i = 0; i < 400; i++) { g.fillStyle = `rgba(80,110,160,${Math.random() * 0.15})`; g.fillRect(rand(0, 256), rand(0, 256), 6, 6); }
+  g.strokeStyle = '#2ef'; g.globalAlpha = 0.7; g.lineWidth = 4; g.strokeRect(0, 0, 256, 256);
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(200, 100);
+  t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+const gridTex = gridTexture();
+const planet = new THREE.Mesh(
+  new THREE.SphereGeometry(R, 256, 128),
+  new THREE.MeshStandardMaterial({ map: gridTex, emissiveMap: gridTex, emissive: 0x2a4a6a, roughness: 0.9 })
+);
+scene.add(planet);
+
+// ---------- Background stars ----------
+{
+  const N = 4000, arr = new Float32Array(N * 3);
+  for (let i = 0; i < N; i++) randUnit().multiplyScalar(40000).toArray(arr, i * 3);
+  const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+  scene.add(new THREE.Points(geo, new THREE.PointsMaterial({ color: 0xffffff, size: 1.5, sizeAttenuation: false, fog: false })));
+}
+
+// ---------- Cities (instanced tall buildings) ----------
+function windowTexture() {
+  const c = document.createElement('canvas'); c.width = 64; c.height = 256;
+  const g = c.getContext('2d');
+  g.fillStyle = '#0a0e18'; g.fillRect(0, 0, 64, 256);
+  const cols = ['#9ef', '#fd8', '#f6c', '#8fd'];
+  for (let y = 4; y < 256; y += 8) for (let x = 4; x < 64; x += 8)
+    if (Math.random() < 0.35) { g.fillStyle = cols[(Math.random() * cols.length) | 0]; g.fillRect(x, y, 4, 4); }
+  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+}
+const winTex = windowTexture();
+const CITIES = 90, PER_CITY = 110, CITY_RADIUS = 450;
+const buildings = new THREE.InstancedMesh(
+  new THREE.BoxGeometry(1, 1, 1),
+  new THREE.MeshStandardMaterial({ map: winTex, emissiveMap: winTex, emissive: 0xffffff, emissiveIntensity: 0.9, roughness: 0.5, metalness: 0.4 }),
+  CITIES * PER_CITY
+);
+const Y = new THREE.Vector3(0, 1, 0);
+const _m = new THREE.Matrix4(), _q = new THREE.Quaternion(), _q2 = new THREE.Quaternion(), _s = new THREE.Vector3(), _p = new THREE.Vector3();
+const cityCenters = [];
+{
+  let k = 0; const col = new THREE.Color();
+  for (let c = 0; c < CITIES; c++) {
+    const cn = randUnit(); cityCenters.push(cn);
+    for (let i = 0; i < PER_CITY; i++) {
+      const d = CITY_RADIUS * Math.pow(Math.random(), 0.7);
+      const n = scatter(cn, d);
+      const centerBoost = 1 - d / CITY_RADIUS;
+      const h = 40 + Math.pow(Math.random(), 2) * 380 * (0.3 + centerBoost);
+      const w = rand(14, 34), dep = rand(14, 34);
+      _q.setFromUnitVectors(Y, n).multiply(_q2.setFromAxisAngle(Y, rand(0, Math.PI)));
+      _p.copy(n).multiplyScalar(R + h / 2 - 1);
+      _m.compose(_p, _q, _s.set(w, h, dep));
+      buildings.setMatrixAt(k, _m);
+      buildings.setColorAt(k, col.setHSL(rand(0.55, 0.75), 0.3, rand(0.35, 0.6)));
+      k++;
+    }
+  }
+}
+scene.add(buildings);
+
+// ---------- Collectible stars ----------
+const STAR_N = 400;
+const starMesh = new THREE.InstancedMesh(
+  new THREE.OctahedronGeometry(60),
+  new THREE.MeshStandardMaterial({ color: 0xffd84a, emissive: 0xffaa00, emissiveIntensity: 1.6, metalness: 0.3, roughness: 0.3 }),
+  STAR_N
+);
+const stars = [];
+for (let i = 0; i < STAR_N; i++) {
+  const nearCity = i < STAR_N * 0.6;
+  const n = nearCity ? scatter(cityCenters[(Math.random() * CITIES) | 0], rand(0, 650)) : randUnit();
+  const alt = nearCity ? rand(90, 480) : rand(80, 500);
+  stars.push({ pos: n.clone().multiplyScalar(R + alt), base: new THREE.Quaternion().setFromUnitVectors(Y, n), alive: true, phase: rand(0, 6) });
+}
+scene.add(starMesh);
+document.getElementById('starsTotal').textContent = STAR_N;
+
+// ---------- Ship (futuristic, built from primitives, nose points -Z) ----------
+function makeShip() {
+  const g = new THREE.Group();
+  const hull = new THREE.MeshStandardMaterial({ color: 0xdde6f0, metalness: 0.7, roughness: 0.3 });
+  const dark = new THREE.MeshStandardMaterial({ color: 0x223344, metalness: 0.8, roughness: 0.4, side: THREE.DoubleSide });
+  const glow = new THREE.MeshBasicMaterial({ color: 0x44ddff });
+
+  const body = new THREE.Mesh(new THREE.ConeGeometry(1.2, 9, 6), hull);
+  body.rotation.x = -Math.PI / 2; body.scale.set(1.6, 1, 0.6); g.add(body);
+
+  const canopy = new THREE.Mesh(new THREE.SphereGeometry(0.8, 12, 8), new THREE.MeshStandardMaterial({ color: 0x113355, emissive: 0x2288ff, emissiveIntensity: 0.6, metalness: 1, roughness: 0.1 }));
+  canopy.scale.set(1, 0.6, 2.2); canopy.position.set(0, 0.6, -0.5); g.add(canopy);
+
+  const ws = new THREE.Shape();
+  ws.moveTo(0.6, 2); ws.lineTo(7, -3); ws.lineTo(7, -4); ws.lineTo(0.6, -3.5); ws.closePath();
+  const wingGeo = new THREE.ExtrudeGeometry(ws, { depth: 0.25, bevelEnabled: false });
+  wingGeo.rotateX(-Math.PI / 2);
+  const wr = new THREE.Mesh(wingGeo, dark); g.add(wr);
+  const wl = new THREE.Mesh(wingGeo, dark); wl.scale.x = -1; g.add(wl);
+
+  for (const sx of [-1, 1]) {
+    const tip = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.2, 1.5), glow);
+    tip.position.set(7 * sx, 0.1, 3.5); g.add(tip);
+    const fin = new THREE.Mesh(new THREE.BoxGeometry(0.15, 2, 2), dark);
+    fin.position.set(1.2 * sx, 1, 3.5); fin.rotation.z = -0.35 * sx; g.add(fin);
+  }
+
+  const engine = new THREE.Mesh(new THREE.CylinderGeometry(0.9, 1.1, 1.5, 12), dark);
+  engine.rotation.x = Math.PI / 2; engine.position.z = 4.6; g.add(engine);
+  const nozzle = new THREE.Mesh(new THREE.CircleGeometry(0.8, 16), glow);
+  nozzle.position.z = 5.36; g.add(nozzle);
+
+  const flameMat = new THREE.MeshBasicMaterial({ color: 0x55ccff, transparent: true, opacity: 0.8, blending: THREE.AdditiveBlending, depthWrite: false });
+  const flameGeo = new THREE.ConeGeometry(0.75, 1, 12); flameGeo.translate(0, -0.5, 0); flameGeo.rotateX(-Math.PI / 2);
+  const flame = new THREE.Mesh(flameGeo, flameMat);
+  flame.position.z = 5.4; g.add(flame);
+  g.userData.flame = flame;
+  return g;
+}
+const ship = makeShip();
+scene.add(ship);
+
+// ---------- Ship state ----------
+const startCity = cityCenters[0];
+const pos = scatter(startCity, 900).multiplyScalar(R + 120);
+let up = pos.clone().normalize();
+const f = startCity.clone().multiplyScalar(R).sub(pos); f.addScaledVector(up, -f.dot(up)).normalize(); // heading
+const vel = new THREE.Vector3();
+let pitch = 0;                     // nose angle above the local horizon
+const nose = f.clone();            // full 3D nose direction (heading + pitch)
+const camN = f.clone();
+let fuel = FUEL_MAX, collected = 0, traveled = 0, roll = 0, yawRate = 0, flameLen = 0.3;
+
+// ---------- Input ----------
+const keys = new Set();
+addEventListener('keydown', e => { keys.add(e.code); if (e.code === 'Space') e.preventDefault(); });
+addEventListener('keyup', e => keys.delete(e.code));
+addEventListener('blur', () => keys.clear());
+const k = (...c) => c.some(x => keys.has(x)) ? 1 : 0;
+
+// Q/E double-tap detection for barrel rolls
+const BARREL_TIME = 0.55, DOUBLE_TAP_MS = 300;
+const spin = { dir: 0, t: 0 }, lastTap = { KeyQ: -1e9, KeyE: -1e9 };
+addEventListener('keydown', e => {
+  if ((e.code !== 'KeyQ' && e.code !== 'KeyE') || e.repeat) return;
+  const now = performance.now();
+  if (now - lastTap[e.code] < DOUBLE_TAP_MS && !spin.dir) {
+    spin.dir = e.code === 'KeyQ' ? 1 : -1; spin.t = 0; lastTap[e.code] = -1e9;
+    if (ac) whoosh(700, 2500, 0.2);
+  } else lastTap[e.code] = now;
+});
+
+let mouseDX = 0, mouseDY = 0;
+const startEl = document.getElementById('start');
+startEl.addEventListener('click', () => { initAudio(); renderer.domElement.requestPointerLock(); });
+document.addEventListener('pointerlockchange', () => {
+  startEl.style.display = document.pointerLockElement ? 'none' : 'flex';
+});
+addEventListener('mousemove', e => {
+  if (document.pointerLockElement) { mouseDX += e.movementX; mouseDY += e.movementY; }
+});
+
+// ---------- HUD ----------
+const $ = id => document.getElementById(id);
+const hud = { stars: $('stars'), spd: $('spd'), alt: $('alt'), lap: $('lap'), fill: $('boostFill'), flash: $('flash'), drift: $('drift') };
+let flashT = 0;
+
+// ---------- Audio (everything synthesized with Web Audio, no files) ----------
+let ac = null, sfx, musicBus, noiseBuf, drive;
+const A = {};
+let musicOn = true, wasBoosting = false, wasBraking = false, lastStarT = -10, combo = 0;
+const MUSIC_VOL = 0.32;
+const MASTER_VOL = 0.225; // overall volume (25% of the original 0.9)
+
+const mkGain = (v = 0, dest) => { const g = ac.createGain(); g.gain.value = v; if (dest) g.connect(dest); return g; };
+const mkFilt = (type, f, Q = 1) => { const b = ac.createBiquadFilter(); b.type = type; b.frequency.value = f; b.Q.value = Q; return b; };
+const mkOsc = (type, f, t) => { const o = ac.createOscillator(); o.type = type; o.frequency.value = f; o.start(t); return o; };
+function noiseLoop() { const s = ac.createBufferSource(); s.buffer = noiseBuf; s.loop = true; s.start(); return s; }
+function noiseHit(t, len) { const s = ac.createBufferSource(); s.buffer = noiseBuf; s.start(t, Math.random()); s.stop(t + len); return s; }
+function env(g, t, peak, attack, decay) {
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(peak, t + attack);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + attack + decay);
+}
+
+function initAudio() {
+  if (ac) { ac.resume(); return; }
+  ac = new AudioContext();
+  const comp = ac.createDynamicsCompressor(); comp.connect(ac.destination);
+  const master = mkGain(MASTER_VOL, comp);
+  sfx = mkGain(1, master);
+  musicBus = mkGain(musicOn ? MUSIC_VOL : 0, master);
+  noiseBuf = ac.createBuffer(1, ac.sampleRate * 2, ac.sampleRate);
+  const d = noiseBuf.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  drive = ac.createWaveShaper();
+  const curve = new Float32Array(1024); for (let i = 0; i < 1024; i++) { const x = i / 511.5 - 1; curve[i] = 9 * x / (1 + 8 * Math.abs(x)); }
+  drive.curve = curve;
+
+  // Engine hum: detuned saws + sub, lowpassed; pitch/brightness follow speed & thrust
+  A.engF = mkFilt('lowpass', 400, 3); A.engG = mkGain(0, sfx); A.engF.connect(A.engG);
+  A.eng1 = mkOsc('sawtooth', 50); A.eng2 = mkOsc('sawtooth', 50.6); A.eng3 = mkOsc('square', 25);
+  A.eng1.connect(A.engF); A.eng2.connect(A.engF); A.eng3.connect(mkGain(0.5, A.engF));
+  // Wind rush: grows with speed (log scale, since speed is unlimited)
+  A.windF = mkFilt('bandpass', 500, 0.7); A.windG = mkGain(0, sfx);
+  noiseLoop().connect(A.windF); A.windF.connect(A.windG);
+  // Boost roar: bright noise + growl
+  A.boostF = mkFilt('bandpass', 1500, 0.8); A.boostG = mkGain(0, sfx);
+  noiseLoop().connect(A.boostF); A.boostF.connect(A.boostG);
+  A.boostO = mkOsc('sawtooth', 110); const bl = mkFilt('lowpass', 900); A.boostO.connect(bl); bl.connect(A.boostG);
+  // Brake: tyre-like screech (resonant noise + wobbling tone)
+  A.brakeF = mkFilt('bandpass', 2800, 12); A.brakeG = mkGain(0, sfx);
+  noiseLoop().connect(A.brakeF); A.brakeF.connect(mkGain(1.5, A.brakeG));
+  A.brakeO = mkOsc('sawtooth', 1400); const lfo = mkOsc('sine', 9); lfo.connect(mkGain(120)).connect(A.brakeO.frequency);
+  const bf = mkFilt('bandpass', 1400, 6); A.brakeO.connect(bf); bf.connect(mkGain(0.12, A.brakeG));
+
+  // Music echo (for the cowbell)
+  A.echo = ac.createDelay(1); A.echo.delayTime.value = STEP * 3;
+  const fb = mkGain(0.35); A.echo.connect(fb); fb.connect(A.echo); A.echo.connect(mkGain(0.5, musicBus));
+  nextNote = ac.currentTime + 0.1;
+  setInterval(scheduler, 25);
+}
+
+function whoosh(f0, f1, vol) {
+  const t = ac.currentTime, f = mkFilt('bandpass', f0, 1.5), g = mkGain(0, sfx);
+  noiseHit(t, 0.8).connect(f); f.connect(g);
+  f.frequency.setValueAtTime(f0, t); f.frequency.exponentialRampToValueAtTime(f1, t + 0.5);
+  env(g, t, vol, 0.03, 0.6);
+}
+
+function playStar() {
+  if (!ac) return;
+  const t = ac.currentTime;
+  combo = t - lastStarT < 2.5 ? Math.min(combo + 1, 12) : 0; // quick chains climb in pitch
+  lastStarT = t;
+  const base = 880 * Math.pow(2, combo / 12);
+  [0, 4, 7, 12].forEach((n, i) => {
+    const ti = t + i * 0.06, o = mkOsc('triangle', base * Math.pow(2, n / 12), ti), g = mkGain(0, sfx);
+    o.connect(g); env(g, ti, 0.18, 0.005, 0.5); o.stop(ti + 0.6);
+  });
+  const sp = mkOsc('sine', base * 4, t + 0.24), sg = mkGain(0, sfx);
+  sp.connect(sg); env(sg, t + 0.24, 0.06, 0.005, 0.8); sp.stop(t + 1.1);
+}
+
+function updateAudio(speed, pushing, boosting, braking) {
+  if (!ac) return;
+  const t = ac.currentTime, s = Math.log2(1 + speed / 40), p = pushing ? 1 : 0, b = boosting ? 1 : 0;
+  const ef = 40 + 14 * s + p * 10 + b * 25;
+  A.eng1.frequency.setTargetAtTime(ef, t, 0.08);
+  A.eng2.frequency.setTargetAtTime(ef * 1.012, t, 0.08);
+  A.eng3.frequency.setTargetAtTime(ef / 2, t, 0.08);
+  A.engF.frequency.setTargetAtTime(250 + 180 * s + p * 500 + b * 1500, t, 0.08);
+  A.engG.gain.setTargetAtTime(0.05 + 0.06 * p + 0.05 * b, t, 0.1);
+  A.windF.frequency.setTargetAtTime(Math.min(5000, 300 + 250 * s), t, 0.2);
+  A.windG.gain.setTargetAtTime(Math.min(0.3, 0.035 * s), t, 0.2);
+  A.boostO.frequency.setTargetAtTime(90 + 20 * s, t, 0.1);
+  A.boostG.gain.setTargetAtTime(b * 0.22, t, boosting ? 0.03 : 0.25);
+  const scr = braking ? Math.min(1, speed / 60) : 0;
+  A.brakeG.gain.setTargetAtTime(braking ? 0.03 + 0.17 * scr : 0, t, braking ? 0.03 : 0.12);
+  A.brakeF.frequency.setTargetAtTime(2200 + 600 * scr + 300 * Math.random(), t, 0.05);
+  if (boosting && !wasBoosting) whoosh(300, 4000, 0.35);
+  if (braking && !wasBraking) whoosh(3000, 300, 0.25);
+  wasBoosting = boosting; wasBraking = braking;
+}
+
+// --- Drift-phonk loop: cowbell melody, 808 slides, claps, hats (Am - F - Dm - E) ---
+const BPM = 130, STEP = 60 / BPM / 4; // 16th notes
+let nextNote = 0, step = 0;
+const n2f = n => 440 * Math.pow(2, n / 12); // semitones from A4
+const ROOTS = [55, 43.65, 36.71, 41.2];     // A1 F1 D1 E1
+const CHORDS = [[-12, -9, -5], [-16, -12, -9], [-19, -16, -12], [-17, -13, -10]];
+const _ = null;
+const MEL_A = [12, _, 12, _, 10, _, 7, _, 12, _, _, 15, _, 10, 7, _];
+const MEL = [MEL_A, MEL_A, MEL_A, [14, _, 14, _, 12, _, 11, _, 7, _, _, 11, _, _, 7, _]];
+
+function kick(t) {
+  const o = mkOsc('sine', 160, t), g = mkGain(0, musicBus);
+  o.frequency.setValueAtTime(160, t); o.frequency.exponentialRampToValueAtTime(42, t + 0.12);
+  o.connect(g); env(g, t, 0.9, 0.002, 0.35); o.stop(t + 0.5);
+}
+function bass808(t, f) {
+  const o = mkOsc('sine', f * 2, t), g = mkGain(0, musicBus), pre = mkGain(0.6);
+  o.frequency.setValueAtTime(f * 2, t); o.frequency.exponentialRampToValueAtTime(f, t + 0.06);
+  o.connect(pre); const ws = ac.createWaveShaper(); ws.curve = drive.curve; pre.connect(ws); ws.connect(g);
+  env(g, t, 0.35, 0.005, 0.5); o.stop(t + 0.6);
+}
+function clap(t) {
+  const f = mkFilt('bandpass', 1600, 1.5), g = mkGain(0, musicBus);
+  noiseHit(t, 0.25).connect(f); f.connect(g); env(g, t, 0.45, 0.002, 0.18);
+}
+function hat(t, open) {
+  const f = mkFilt('highpass', 7500), g = mkGain(0, musicBus);
+  noiseHit(t, 0.3).connect(f); f.connect(g); env(g, t, open ? 0.12 : 0.1, 0.001, open ? 0.25 : 0.04);
+}
+function cowbell(t, f) {
+  const bp = mkFilt('bandpass', f * 1.5, 1), g = mkGain(0, musicBus);
+  const o1 = mkOsc('square', f, t), o2 = mkOsc('square', f * 1.48, t);
+  o1.connect(bp); o2.connect(bp); bp.connect(g); g.connect(A.echo);
+  env(g, t, 0.13, 0.002, 0.3); o1.stop(t + 0.4); o2.stop(t + 0.4);
+}
+function pad(t, notes, dur) {
+  const lp = mkFilt('lowpass', 900), g = mkGain(0, musicBus); lp.connect(g);
+  g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(0.03, t + 0.4); g.gain.linearRampToValueAtTime(0, t + dur);
+  for (const n of notes) for (const det of [-6, 6]) {
+    const o = mkOsc('sawtooth', n2f(n), t); o.detune.value = det; o.connect(lp); o.stop(t + dur + 0.05);
+  }
+}
+function playStep(i, t) {
+  const bar = (i >> 4) & 3, s = i & 15;
+  if (s === 0) pad(t, CHORDS[bar], STEP * 16);
+  if (s === 0 || s === 10) kick(t);
+  if (s === 0 || s === 3 || s === 6 || s === 10) bass808(t, ROOTS[bar]);
+  if (s === 4 || s === 12) clap(t);
+  if (s % 2 === 0 || (bar === 3 && s >= 12)) hat(t, s === 14 && bar !== 3);
+  const m = MEL[bar][s]; if (m !== null) cowbell(t, n2f(m));
+}
+function scheduler() {
+  if (nextNote < ac.currentTime - 0.2) nextNote = ac.currentTime + 0.05; // tab was in background
+  while (nextNote < ac.currentTime + 0.12) {
+    if (musicOn) playStep(step, nextNote);
+    nextNote += STEP; step = (step + 1) % 64;
+  }
+}
+
+const musicBtn = document.getElementById('musicBtn');
+function toggleMusic() {
+  musicOn = !musicOn;
+  musicBtn.textContent = `♪ Music: ${musicOn ? 'ON' : 'OFF'}`;
+  if (ac) musicBus.gain.setTargetAtTime(musicOn ? MUSIC_VOL : 0, ac.currentTime, 0.1);
+}
+musicBtn.addEventListener('click', e => { e.stopPropagation(); toggleMusic(); musicBtn.blur(); });
+addEventListener('keydown', e => { if (e.code === 'KeyM' && !e.repeat) toggleMusic(); });
+
+// ---------- Update ----------
+const _vt = new THREE.Vector3(), _np = new THREE.Vector3(), _tq = new THREE.Quaternion(), _right = new THREE.Vector3(), _back = new THREE.Vector3();
+const _shipUp = new THREE.Vector3(), _camUp = new THREE.Vector3(), _prev = new THREE.Vector3(), _cp = new THREE.Vector3();
+const _seg = new THREE.Line3(), Z = new THREE.Vector3(0, 0, 1);
+function update(dt, time) {
+  const thrust = k('KeyW', 'ArrowUp');
+  const reverse = k('KeyS', 'ArrowDown');
+  const braking = k('Space') && fuel > 0;
+  const boosting = !braking && k('ShiftLeft', 'ShiftRight') && fuel > 0;
+
+  // Fuel: boost and brake both drain 1/s; refills fully in 5 s when neither is used
+  fuel = (boosting || braking) ? Math.max(0, fuel - dt) : Math.min(FUEL_MAX, fuel + FUEL_REGEN * dt);
+
+  // Steering: mouse (or A/D) rotates only the NOSE; velocity is untouched -> sliding.
+  // While braking the nose swings harder, like a handbrake drift.
+  const turnMult = braking ? BRAKE_TURN_MULT : 1;
+  const yaw = (-mouseDX * MOUSE_SENS + (k('KeyA', 'ArrowLeft') - k('KeyD', 'ArrowRight')) * KEY_TURN * dt) * turnMult;
+  pitch = THREE.MathUtils.clamp(pitch - mouseDY * MOUSE_SENS * turnMult, -MAX_PITCH, MAX_PITCH);
+  mouseDX = mouseDY = 0;
+  f.applyAxisAngle(up, yaw);
+  yawRate += (yaw / Math.max(dt, 1e-4) - yawRate) * (1 - Math.exp(-8 * dt));
+  nose.copy(f).multiplyScalar(Math.cos(pitch)).addScaledVector(up, Math.sin(pitch));
+
+  // Thrust along the nose. No speed cap: holding W accelerates forever.
+  if (thrust) vel.addScaledVector(nose, ACCEL * dt);
+  if (reverse) vel.addScaledVector(nose, -REVERSE_ACCEL * dt);
+  if (boosting) vel.addScaledVector(nose, BOOST_ACCEL * dt);
+
+  // Brake: intense, works on the whole velocity (whatever direction you're sliding)
+  if (braking) {
+    const sp = vel.length();
+    const ns = Math.max(0, sp * Math.exp(-BRAKE_EXP * dt) - BRAKE_LIN * dt);
+    vel.multiplyScalar(sp > 0 ? ns / sp : 0);
+  }
+
+  // Move along the sphere: no gravity, but "level" flight follows the curvature,
+  // so flying straight takes you around the planet forever.
+  const vr = vel.dot(up);
+  _vt.copy(vel).addScaledVector(up, -vr);
+  const r = pos.length();
+  _prev.copy(pos);
+  _np.copy(pos).addScaledVector(vel, dt).setLength(r + vr * dt);
+  const newUp = _np.clone().normalize();
+  traveled += up.angleTo(newUp) * R;
+  _tq.setFromUnitVectors(up, newUp);
+  vel.applyQuaternion(_tq); f.applyQuaternion(_tq); nose.applyQuaternion(_tq); camN.applyQuaternion(_tq);
+  pos.copy(_np); up = newUp;
+
+  // Altitude bounds (soft bounce)
+  const alt = pos.length() - R;
+  if (alt < MIN_ALT) { pos.setLength(R + MIN_ALT); const v = vel.dot(up); if (v < 0) vel.addScaledVector(up, -1.5 * v); }
+  if (alt > MAX_ALT) { pos.setLength(R + MAX_ALT); const v = vel.dot(up); if (v > 0) vel.addScaledVector(up, -1.5 * v); }
+  f.addScaledVector(up, -f.dot(up)).normalize();
+  nose.copy(f).multiplyScalar(Math.cos(pitch)).addScaledVector(up, Math.sin(pitch));
+
+  // Ship orientation: nose frame + visual bank from turn rate
+  // Q/E held -> knife-edge (wings vertical) toward that side; otherwise bank from turning
+  const knife = k('KeyQ') - k('KeyE');
+  const rollTarget = knife ? knife * Math.PI / 2 : THREE.MathUtils.clamp(yawRate * 0.35, -1.2, 1.2);
+  roll += (rollTarget - roll) * (1 - Math.exp(-(knife ? 10 : 6) * dt));
+  // Double-tap Q/E -> full barrel roll on top of that
+  let spinAngle = 0;
+  if (spin.dir) {
+    spin.t += dt / BARREL_TIME;
+    if (spin.t >= 1) spin.dir = 0;
+    else spinAngle = spin.dir * spin.t * spin.t * (3 - 2 * spin.t) * Math.PI * 2;
+  }
+  _right.crossVectors(f, up).normalize();
+  _shipUp.crossVectors(_right, nose).normalize();
+  _back.copy(nose).negate();
+  _m.makeBasis(_right, _shipUp, _back);
+  ship.quaternion.setFromRotationMatrix(_m).multiply(_q2.setFromAxisAngle(Z, roll + spinAngle));
+  ship.position.copy(pos);
+
+  // Engine flame (blue thrust, pink boost, orange retro-burn while braking)
+  const targetFlame = boosting ? 6 : braking ? 3.5 : thrust ? 2.5 : 0.4;
+  flameLen += (targetFlame - flameLen) * (1 - Math.exp(-10 * dt));
+  const fl = ship.userData.flame;
+  fl.scale.set(boosting ? 1.3 : 1, boosting ? 1.3 : 1, flameLen * (0.9 + Math.random() * 0.2));
+  fl.material.color.set(boosting ? 0xff66ff : braking ? 0xff8833 : 0x55ccff);
+
+  // Chase camera (smoothly follows the nose, so you see the slide)
+  camN.lerp(nose, 1 - Math.exp(-5 * dt)).normalize();
+  const speed = vel.length();
+  _right.crossVectors(camN, up).normalize();
+  _camUp.crossVectors(_right, camN).normalize();
+  camera.position.copy(pos).addScaledVector(camN, -(22 + Math.min(speed * 0.02, 25))).addScaledVector(_camUp, 7);
+  camera.up.copy(_camUp);
+  camera.lookAt(_p.copy(pos).addScaledVector(camN, 15).addScaledVector(_camUp, 2));
+  const fov = boosting ? 88 : 70 + Math.min(speed / 100, 15);
+  camera.fov += (fov - camera.fov) * (1 - Math.exp(-4 * dt)); camera.updateProjectionMatrix();
+
+  // Stars: spin + collect (segment test so you can't tunnel through at huge speeds)
+  _seg.set(_prev, pos);
+  for (let i = 0; i < STAR_N; i++) {
+    const s = stars[i];
+    if (s.alive && _seg.closestPointToPoint(s.pos, true, _cp).distanceToSquared(s.pos) < 70 * 70) {
+      s.alive = false; collected++; flashT = 0.6; playStar();
+    }
+    if (s.alive) {
+      _q.copy(s.base).multiply(_q2.setFromAxisAngle(Y, time * 2 + s.phase));
+      _m.compose(s.pos, _q, _s.setScalar(1 + 0.15 * Math.sin(time * 4 + s.phase)));
+    } else _m.makeScale(0, 0, 0);
+    starMesh.setMatrixAt(i, _m);
+  }
+  starMesh.instanceMatrix.needsUpdate = true;
+
+  // HUD
+  const driftDeg = speed > 10 ? THREE.MathUtils.radToDeg(vel.angleTo(nose)) : 0;
+  hud.stars.textContent = collected;
+  hud.spd.textContent = speed.toFixed(0);
+  hud.drift.textContent = braking ? 'BRAKE' : driftDeg > 20 ? `DRIFT ${driftDeg.toFixed(0)}°` : '';
+  hud.alt.textContent = (pos.length() - R).toFixed(0);
+  hud.lap.textContent = (traveled / (2 * Math.PI * R)).toFixed(2);
+  hud.fill.style.width = (fuel / FUEL_MAX * 100) + '%';
+  hud.fill.style.background = boosting ? '#f6f' : braking ? '#f83' : fuel < FUEL_MAX ? '#2a8' : '#4cf';
+  flashT -= dt; hud.flash.style.opacity = flashT > 0 ? 1 : 0;
+
+  updateAudio(speed, thrust || reverse, boosting, braking);
+}
+
+// ---------- Loop ----------
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  update(dt, clock.elapsedTime);
+  renderer.render(scene, camera);
+});
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
