@@ -5,14 +5,20 @@
 <title>Zero-G Flight</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; font-family: system-ui, sans-serif; color: #cfe8ff; }
-  #hud { position: fixed; left: 16px; top: 16px; font-size: 14px; line-height: 1.6; text-shadow: 0 0 4px #000; pointer-events: none; }
-  #boost { width: 200px; height: 10px; border: 1px solid #6cf; margin-top: 2px; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; font-family: system-ui, sans-serif; color: #e6f3ff; }
+  #hud { position: fixed; left: 16px; top: 16px; font-size: 14px; line-height: 1.6; text-shadow: 0 0 4px #000, 0 0 2px #000; pointer-events: none; }
+  #boost { width: 200px; height: 10px; border: 1px solid #6cf; margin-top: 2px; background: rgba(0,0,0,.3); }
   #boostFill { height: 100%; width: 100%; background: #4cf; }
-  #help { position: fixed; right: 16px; bottom: 16px; font-size: 12px; opacity: .75; text-align: right; line-height: 1.6; pointer-events: none; }
+  #help { position: fixed; right: 16px; bottom: 16px; font-size: 12px; opacity: .85; text-align: right; line-height: 1.6; pointer-events: none; text-shadow: 0 0 4px #000; }
   #flash { position: fixed; left: 50%; top: 30%; transform: translateX(-50%); font-size: 32px; color: #ffd84a; opacity: 0; transition: opacity .4s; pointer-events: none; text-shadow: 0 0 12px #fa0; }
   #drift { color: #f6c; }
-  #musicBtn { position: fixed; right: 16px; top: 16px; z-index: 10; background: rgba(10,20,40,.7); color: #cfe8ff; border: 1px solid #6cf; border-radius: 6px; padding: 6px 12px; font: inherit; font-size: 13px; cursor: pointer; }
+  .panel { background: rgba(10,20,40,.7); color: #e6f3ff; border: 1px solid #6cf; border-radius: 6px; font: inherit; font-size: 13px; }
+  #musicBtn { position: fixed; right: 16px; top: 16px; z-index: 10; padding: 6px 12px; cursor: pointer; }
+  #physics { position: fixed; right: 16px; top: 56px; z-index: 10; padding: 8px 10px; }
+  #physics .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 3px 0; }
+  #physics button { width: 28px; height: 24px; cursor: pointer; padding: 0; font-size: 16px; line-height: 1; }
+  #physics .val { display: inline-block; width: 48px; text-align: center; font-variant-numeric: tabular-nums; }
+  #physics small { opacity: .7; }
   #start { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 28px; background: rgba(0,0,20,.45); cursor: pointer; letter-spacing: 2px; }
 </style>
 </head>
@@ -22,6 +28,7 @@
   Speed: <span id="spd">0</span> <span id="drift"></span><br>
   Altitude: <span id="alt">0</span><br>
   Laps around planet: <span id="lap">0</span><br>
+  <span id="tod"></span><br>
   BOOST
   <div id="boost"><div id="boostFill"></div></div>
 </div>
@@ -34,18 +41,30 @@
   Q / E — knife-edge left/right · double-tap — barrel roll<br>
   M — music on/off · Esc — release mouse
 </div>
-<button id="musicBtn">♪ Music: ON</button>
 <div id="start">Click to fly</div>
+<button id="musicBtn" class="panel">♪ Music: ON</button>
+<div id="physics" class="panel">
+  <div class="row">Friction
+    <span><button class="panel" data-p="friction" data-d="-0.1">−</button><span class="val" id="frictionVal"></span><button class="panel" data-p="friction" data-d="0.1">+</button></span>
+  </div>
+  <div class="row">Gravity
+    <span><button class="panel" data-p="gravity" data-d="-0.1">−</button><span class="val" id="gravityVal"></span><button class="panel" data-p="gravity" data-d="0.1">+</button></span>
+  </div>
+  <small>keys: 1 / 2 friction · 3 / 4 gravity</small>
+</div>
 
 <script type="importmap">
-{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
 </script>
 <script type="module">
 import * as THREE from 'three';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 // ---------- Tuning ----------
-const R = 5000;              // planet radius -> circumference ~31.4k units
-// No top speed: thrust keeps adding speed forever (~150 = 3.5 min per lap)
+const R = 10000;             // planet radius -> circumference ~62.8k units
 const ACCEL = 70;            // thrust acceleration (W)
 const REVERSE_ACCEL = 50;    // reverse thrust (S)
 const BOOST_ACCEL = 200;     // extra acceleration while boosting (Shift)
@@ -57,7 +76,12 @@ const KEY_TURN = 1.8;        // rad/s yaw for A/D fallback
 const MAX_PITCH = THREE.MathUtils.degToRad(85);
 const FUEL_MAX = 5;          // seconds of boost/brake
 const FUEL_REGEN = FUEL_MAX / 5; // full refill in 5 s
-const MIN_ALT = 4, MAX_ALT = 3000;
+const MIN_ALT = 4, MAX_ALT = 4000;
+const DAY_LENGTH = 300;      // seconds for a full day/night cycle
+// Adjustable physics (buttons / keys). Friction = air drag, gravity in "g".
+const phys = { friction: 0.5, gravity: 1.0 };
+const DRAG_SCALE = 0.4;      // friction 0.5 -> top speed ~350 on W alone (0 = unlimited)
+const G_SCALE = 9.8;         // 1 g = 9.8 units/s^2 toward the planet center
 
 // ---------- Renderer / scene ----------
 const renderer = new THREE.WebGLRenderer({ antialias: true, logarithmicDepthBuffer: true });
@@ -66,16 +90,17 @@ renderer.setSize(innerWidth, innerHeight);
 document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x02030a);
-scene.fog = new THREE.FogExp2(0x0a1030, 0.00035);
-const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.5, 60000);
+scene.background = new THREE.Color();
+scene.fog = new THREE.FogExp2(0x000000, 0.0002);
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.5, 80000);
 
-scene.add(new THREE.AmbientLight(0x6070a0, 0.8));
-const sun = new THREE.DirectionalLight(0xffeedd, 1.8);
-sun.position.set(1, 0.6, 0.3).multiplyScalar(20000);
+const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+scene.add(ambient);
+const sun = new THREE.DirectionalLight(0xfff1dd, 2.2);
 scene.add(sun);
 
 const rand = (a, b) => a + Math.random() * (b - a);
+const ss = THREE.MathUtils.smoothstep; // ss(x, min, max)
 function randUnit() {
   const u = rand(-1, 1), t = rand(0, Math.PI * 2), s = Math.sqrt(1 - u * u);
   return new THREE.Vector3(s * Math.cos(t), u, s * Math.sin(t));
@@ -85,36 +110,114 @@ function scatter(n, dist) {
   const t = randUnit(); t.addScaledVector(n, -t.dot(n)).normalize();
   return n.clone().multiplyScalar(R).addScaledVector(t, dist).normalize();
 }
+const Y = new THREE.Vector3(0, 1, 0);
+const _m = new THREE.Matrix4(), _q = new THREE.Quaternion(), _q2 = new THREE.Quaternion(), _s = new THREE.Vector3(), _p = new THREE.Vector3();
 
-// ---------- Planet ----------
-function gridTexture() {
+// ---------- Ocean ----------
+function waveTexture() {
   const c = document.createElement('canvas'); c.width = c.height = 256;
   const g = c.getContext('2d');
-  g.fillStyle = '#161d33'; g.fillRect(0, 0, 256, 256);
-  for (let i = 0; i < 400; i++) { g.fillStyle = `rgba(80,110,160,${Math.random() * 0.15})`; g.fillRect(rand(0, 256), rand(0, 256), 6, 6); }
-  g.strokeStyle = '#2ef'; g.globalAlpha = 0.7; g.lineWidth = 4; g.strokeRect(0, 0, 256, 256);
+  g.fillStyle = '#1a6a9c'; g.fillRect(0, 0, 256, 256);
+  for (let i = 0; i < 260; i++) {
+    g.fillStyle = Math.random() < 0.5 ? `rgba(10,50,90,${rand(0.1, 0.3)})` : `rgba(120,200,240,${rand(0.08, 0.25)})`;
+    g.beginPath(); g.ellipse(rand(0, 256), rand(0, 256), rand(6, 26), rand(1, 3), rand(-0.3, 0.3), 0, Math.PI * 2); g.fill();
+  }
+  for (let i = 0; i < 70; i++) { g.fillStyle = `rgba(255,255,255,${rand(0.3, 0.7)})`; g.fillRect(rand(0, 256), rand(0, 256), rand(2, 6), 1); }
   const t = new THREE.CanvasTexture(c);
-  t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(200, 100);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping; t.repeat.set(500, 250);
   t.anisotropy = renderer.capabilities.getMaxAnisotropy();
   t.colorSpace = THREE.SRGBColorSpace;
   return t;
 }
-const gridTex = gridTexture();
-const planet = new THREE.Mesh(
+const waveTex = waveTexture();
+const ocean = new THREE.Mesh(
   new THREE.SphereGeometry(R, 256, 128),
-  new THREE.MeshStandardMaterial({ map: gridTex, emissiveMap: gridTex, emissive: 0x2a4a6a, roughness: 0.9 })
+  new THREE.MeshStandardMaterial({ map: waveTex, roughness: 0.2, metalness: 0.25, emissive: 0x04121f })
 );
-scene.add(planet);
+scene.add(ocean);
 
-// ---------- Background stars ----------
+// ---------- Islands ----------
+const ISLANDS = 70;
+const islands = [];
+// Height above sea level of island `isl` at unit direction d (in the island's local frame, center = +Y).
+// Also stores the normalized distance from center in isl.t (0 = center, ~1.03 = shoreline).
+function islandHeight(isl, d) {
+  const ang = Math.acos(THREE.MathUtils.clamp(d.y, -1, 1));
+  const phi = Math.atan2(d.z, d.x);
+  const rr = isl.ang * (1 + 0.22 * Math.sin(3 * phi + isl.a) + 0.12 * Math.sin(5 * phi + isl.b) + 0.06 * Math.sin(9 * phi + isl.c));
+  const t = ang / rr; isl.t = t;
+  if (t > 1.2) return -10;
+  const hills = 0.35 * isl.H * Math.sin(phi * 2 + isl.b) * Math.sin(t * 7 + isl.a) * (1 - ss(t, 0.3, 0.8));
+  return (isl.H + hills) * (1 - ss(t, 0.45, 0.95)) + 3 * (1 - ss(t, 0.95, 1.1)) - 10 * ss(t, 1.0, 1.2);
+}
 {
-  const N = 4000, arr = new Float32Array(N * 3);
-  for (let i = 0; i < N; i++) randUnit().multiplyScalar(40000).toArray(arr, i * 3);
-  const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.BufferAttribute(arr, 3));
-  scene.add(new THREE.Points(geo, new THREE.PointsMaterial({ color: 0xffffff, size: 1.5, sizeAttenuation: false, fog: false })));
+  const geos = [], d = new THREE.Vector3(), col = new THREE.Color();
+  const grassA = new THREE.Color(0x2f7a30), grassB = new THREE.Color(0x63a845), sand = new THREE.Color(0xe8d6a0), wet = new THREE.Color(0x3c9aa8);
+  for (let i = 0; i < ISLANDS; i++) {
+    const radius = i === 0 ? 1100 : rand(350, 1100), ang = radius / R;
+    let n;
+    for (let tries = 0; tries < 50; tries++) { // keep islands apart
+      n = randUnit();
+      if (islands.every(o => n.angleTo(o.n) > (ang + o.ang) * 1.8)) break;
+    }
+    const isl = { n, ang, radius, H: rand(6, 16), a: rand(0, 6.3), b: rand(0, 6.3), c: rand(0, 6.3), city: i === 0 || Math.random() < 0.7, t: 0 };
+    isl.q = new THREE.Quaternion().setFromUnitVectors(Y, n);
+    isl.qi = isl.q.clone().invert();
+    isl.cosMax = Math.cos(ang * 1.8);
+    islands.push(isl);
+
+    const g = new THREE.SphereGeometry(1, 96, 24, 0, Math.PI * 2, 0, ang * 1.4 * 1.2);
+    const P = g.attributes.position, colors = new Float32Array(P.count * 3);
+    for (let v = 0; v < P.count; v++) {
+      d.fromBufferAttribute(P, v).normalize();
+      const h = islandHeight(isl, d), t = isl.t;
+      col.copy(grassA).lerp(grassB, 0.5 + 0.5 * Math.sin(d.x * 4000 + d.z * 3000))
+         .lerp(sand, ss(t, 0.8, 0.9)).lerp(wet, ss(t, 1.02, 1.15));
+      col.toArray(colors, v * 3);
+      d.applyQuaternion(isl.q).multiplyScalar(R + h);
+      P.setXYZ(v, d.x, d.y, d.z);
+    }
+    g.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    g.deleteAttribute('uv');
+    g.computeVertexNormals();
+    geos.push(g);
+  }
+  scene.add(new THREE.Mesh(mergeGeometries(geos), new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.95 })));
+}
+const _gd = new THREE.Vector3();
+function groundHeight(upv) { // terrain height (>= 0 = sea level) under a world unit direction
+  let h = 0;
+  for (const isl of islands) {
+    if (upv.dot(isl.n) < isl.cosMax) continue;
+    h = Math.max(h, islandHeight(isl, _gd.copy(upv).applyQuaternion(isl.qi)));
+  }
+  return h;
+}
+// Random spot on an island: angular spread `spread` (x island radius), bias `pow` (>1 = toward center)
+function islandSpot(isl, spread, pow, maxT, minH) {
+  const d = new THREE.Vector3();
+  for (let tries = 0; tries < 30; tries++) {
+    const a = isl.ang * spread * Math.pow(Math.random(), pow), phi = rand(0, Math.PI * 2);
+    d.set(Math.sin(a) * Math.cos(phi), Math.cos(a), Math.sin(a) * Math.sin(phi));
+    const h = islandHeight(isl, d);
+    if (isl.t < maxT && h > minH) return { dir: d.applyQuaternion(isl.q), h, t: isl.t };
+  }
+  return null;
 }
 
-// ---------- Cities (instanced tall buildings) ----------
+// ---------- Background stars (fade out during the day) ----------
+const starsMat = new THREE.PointsMaterial({ color: 0xffffff, size: 1.5, sizeAttenuation: false, fog: false, transparent: true });
+{
+  const N = 4000, arr = new Float32Array(N * 3);
+  for (let i = 0; i < N; i++) randUnit().multiplyScalar(60000).toArray(arr, i * 3);
+  const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+  scene.add(new THREE.Points(geo, starsMat));
+}
+const sunDisc = new THREE.Mesh(new THREE.SphereGeometry(900, 24, 12), new THREE.MeshBasicMaterial({ color: 0xfff0c0, fog: false }));
+const moonDisc = new THREE.Mesh(new THREE.SphereGeometry(600, 24, 12), new THREE.MeshBasicMaterial({ color: 0xc8d4e8, fog: false }));
+scene.add(sunDisc, moonDisc);
+
+// ---------- Buildings + palms on the islands ----------
 function windowTexture() {
   const c = document.createElement('canvas'); c.width = 64; c.height = 256;
   const g = c.getContext('2d');
@@ -125,38 +228,56 @@ function windowTexture() {
   const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
 }
 const winTex = windowTexture();
-const CITIES = 90, PER_CITY = 110, CITY_RADIUS = 450;
-const buildings = new THREE.InstancedMesh(
-  new THREE.BoxGeometry(1, 1, 1),
-  new THREE.MeshStandardMaterial({ map: winTex, emissiveMap: winTex, emissive: 0xffffff, emissiveIntensity: 0.9, roughness: 0.5, metalness: 0.4 }),
-  CITIES * PER_CITY
-);
-const Y = new THREE.Vector3(0, 1, 0);
-const _m = new THREE.Matrix4(), _q = new THREE.Quaternion(), _q2 = new THREE.Quaternion(), _s = new THREE.Vector3(), _p = new THREE.Vector3();
-const cityCenters = [];
+const buildingMat = new THREE.MeshStandardMaterial({ map: winTex, emissiveMap: winTex, emissive: 0xffffff, emissiveIntensity: 0.9, roughness: 0.5, metalness: 0.4 });
+const bMats = [], bCols = [], palmMats = [];
 {
-  let k = 0; const col = new THREE.Color();
-  for (let c = 0; c < CITIES; c++) {
-    const cn = randUnit(); cityCenters.push(cn);
-    for (let i = 0; i < PER_CITY; i++) {
-      const d = CITY_RADIUS * Math.pow(Math.random(), 0.7);
-      const n = scatter(cn, d);
-      const centerBoost = 1 - d / CITY_RADIUS;
-      const h = 40 + Math.pow(Math.random(), 2) * 380 * (0.3 + centerBoost);
-      const w = rand(14, 34), dep = rand(14, 34);
-      _q.setFromUnitVectors(Y, n).multiply(_q2.setFromAxisAngle(Y, rand(0, Math.PI)));
-      _p.copy(n).multiplyScalar(R + h / 2 - 1);
-      _m.compose(_p, _q, _s.set(w, h, dep));
-      buildings.setMatrixAt(k, _m);
-      buildings.setColorAt(k, col.setHSL(rand(0.55, 0.75), 0.3, rand(0.35, 0.6)));
-      k++;
+  const col = new THREE.Color();
+  for (const isl of islands) {
+    if (isl.city) {
+      const nb = Math.round(isl.radius / 9);
+      for (let i = 0; i < nb; i++) {
+        const s = islandSpot(isl, 0.85, 1.4, 0.75, 0);
+        if (!s) continue;
+        const centerBoost = 1 - Math.min(1, s.t / 0.75);
+        const h = 40 + Math.pow(Math.random(), 2) * 380 * (0.3 + centerBoost);
+        _q.setFromUnitVectors(Y, s.dir).multiply(_q2.setFromAxisAngle(Y, rand(0, Math.PI)));
+        _p.copy(s.dir).multiplyScalar(R + s.h - 4 + h / 2);
+        bMats.push(new THREE.Matrix4().compose(_p, _q, _s.set(rand(14, 34), h, rand(14, 34))));
+        bCols.push(col.setHSL(rand(0.55, 0.75), 0.25, rand(0.45, 0.7)).clone());
+      }
+    }
+    const np = Math.round(isl.radius / (isl.city ? 7 : 4));
+    for (let i = 0; i < np; i++) {
+      const s = islandSpot(isl, 1.3, 0.6, 0.97, 1.5);
+      if (!s) continue;
+      _q.setFromUnitVectors(Y, s.dir).multiply(_q2.setFromAxisAngle(Y, rand(0, Math.PI * 2)));
+      _p.copy(s.dir).multiplyScalar(R + s.h - 0.5);
+      palmMats.push(new THREE.Matrix4().compose(_p, _q, _s.setScalar(rand(1.4, 2.4))));
     }
   }
+  const buildings = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), buildingMat, bMats.length);
+  bMats.forEach((m, i) => { buildings.setMatrixAt(i, m); buildings.setColorAt(i, bCols[i]); });
+  scene.add(buildings);
+
+  // Palm: bent trunk + drooping fronds (base at origin, ~22 units tall before scaling)
+  const trunk = new THREE.CylinderGeometry(0.6, 1.1, 22, 6, 6); trunk.translate(0, 11, 0);
+  const TP = trunk.attributes.position;
+  for (let v = 0; v < TP.count; v++) TP.setX(v, TP.getX(v) + Math.pow(TP.getY(v) / 22, 2) * 3);
+  trunk.computeVertexNormals();
+  const fronds = [];
+  for (let i = 0; i < 7; i++) {
+    const fg = new THREE.BoxGeometry(1.8, 0.25, 11);
+    fg.translate(0, 0, 5.5); fg.rotateX(0.45 + (i % 2) * 0.2); fg.rotateY(i / 7 * Math.PI * 2); fg.translate(3, 22, 0);
+    fronds.push(fg);
+  }
+  const trunks = new THREE.InstancedMesh(trunk, new THREE.MeshStandardMaterial({ color: 0x7a5a3a, roughness: 0.9 }), palmMats.length);
+  const crowns = new THREE.InstancedMesh(mergeGeometries(fronds), new THREE.MeshStandardMaterial({ color: 0x3f9a3a, roughness: 0.8 }), palmMats.length);
+  palmMats.forEach((m, i) => { trunks.setMatrixAt(i, m); crowns.setMatrixAt(i, m); crowns.setColorAt(i, col.setHSL(rand(0.25, 0.33), 0.6, rand(0.3, 0.45))); });
+  scene.add(trunks, crowns);
 }
-scene.add(buildings);
 
 // ---------- Collectible stars ----------
-const STAR_N = 400;
+const STAR_N = 500;
 const starMesh = new THREE.InstancedMesh(
   new THREE.OctahedronGeometry(60),
   new THREE.MeshStandardMaterial({ color: 0xffd84a, emissive: 0xffaa00, emissiveIntensity: 1.6, metalness: 0.3, roughness: 0.3 }),
@@ -164,9 +285,9 @@ const starMesh = new THREE.InstancedMesh(
 );
 const stars = [];
 for (let i = 0; i < STAR_N; i++) {
-  const nearCity = i < STAR_N * 0.6;
-  const n = nearCity ? scatter(cityCenters[(Math.random() * CITIES) | 0], rand(0, 650)) : randUnit();
-  const alt = nearCity ? rand(90, 480) : rand(80, 500);
+  const nearIsland = i < STAR_N * 0.6;
+  const n = nearIsland ? (() => { const isl = islands[(Math.random() * ISLANDS) | 0]; return scatter(isl.n, rand(0, isl.radius * 1.6)); })() : randUnit();
+  const alt = groundHeight(n) + (nearIsland ? rand(90, 480) : rand(70, 450));
   stars.push({ pos: n.clone().multiplyScalar(R + alt), base: new THREE.Quaternion().setFromUnitVectors(Y, n), alive: true, phase: rand(0, 6) });
 }
 scene.add(starMesh);
@@ -215,15 +336,47 @@ const ship = makeShip();
 scene.add(ship);
 
 // ---------- Ship state ----------
-const startCity = cityCenters[0];
-const pos = scatter(startCity, 900).multiplyScalar(R + 120);
+const startIsland = islands[0];
+const pos = scatter(startIsland.n, 2200).multiplyScalar(R + 150);
 let up = pos.clone().normalize();
-const f = startCity.clone().multiplyScalar(R).sub(pos); f.addScaledVector(up, -f.dot(up)).normalize(); // heading
-const vel = new THREE.Vector3();
+const f = startIsland.n.clone().multiplyScalar(R).sub(pos); f.addScaledVector(up, -f.dot(up)).normalize(); // heading
+const vel = f.clone().multiplyScalar(120);
 let pitch = 0;                     // nose angle above the local horizon
 const nose = f.clone();            // full 3D nose direction (heading + pitch)
 const camN = f.clone();
 let fuel = FUEL_MAX, collected = 0, traveled = 0, roll = 0, yawRate = 0, flameLen = 0.3;
+
+// ---------- Day / night ----------
+const SUN_TILT = 0.35;
+let sunAngle = Math.atan2(up.z, up.x) - 0.5; // start in the morning above the start island
+const sunDir = new THREE.Vector3();
+const NIGHT_SKY = new THREE.Color(0x02040c), DAY_SKY = new THREE.Color(0x78b6f0), DUSK_SKY = new THREE.Color(0xf08850);
+const _sky = new THREE.Color();
+function updateSky(dt) {
+  sunAngle += dt * Math.PI * 2 / DAY_LENGTH;
+  sunDir.set(Math.cos(sunAngle) * Math.cos(SUN_TILT), Math.sin(SUN_TILT), Math.sin(sunAngle) * Math.cos(SUN_TILT));
+  sun.position.copy(sunDir).multiplyScalar(30000);
+  // How high the sun is where the ship is: drives sky color, fog, lights
+  const elev = up.dot(sunDir);
+  const day = ss(elev, -0.12, 0.25);
+  const dusk = Math.exp(-Math.pow(elev / 0.14, 2));
+  _sky.copy(NIGHT_SKY).lerp(DAY_SKY, day).lerp(DUSK_SKY, dusk * 0.55);
+  scene.background.copy(_sky);
+  scene.fog.color.copy(_sky);
+  scene.fog.density = 0.00012 + 0.00008 * (1 - day);
+  sun.color.setHSL(0.09, 0.8, 0.6 + 0.35 * (1 - dusk));
+  ambient.intensity = 0.25 + 0.55 * day;
+  ambient.color.setHSL(0.6, 0.4 * (1 - day), 0.6 + 0.3 * day);
+  starsMat.opacity = 1 - day;
+  buildingMat.emissiveIntensity = 0.25 + 1.0 * (1 - day);
+  sunDisc.position.copy(camera.position).addScaledVector(sunDir, 40000);
+  moonDisc.position.copy(camera.position).addScaledVector(sunDir, -40000);
+  waveTex.offset.x += dt * 0.004;
+  // Local clock for the HUD (sun overhead = 12:00)
+  const hourAngle = Math.atan2(up.z, up.x) - sunAngle;
+  const hrs = ((12 - hourAngle / (Math.PI * 2) * 24) % 24 + 24) % 24;
+  hud.tod.textContent = `${day > 0.5 ? '☀' : '☾'} ${String(Math.floor(hrs)).padStart(2, '0')}:${String(Math.floor(hrs % 1 * 60)).padStart(2, '0')}`;
+}
 
 // ---------- Input ----------
 const keys = new Set();
@@ -254,9 +407,24 @@ addEventListener('mousemove', e => {
   if (document.pointerLockElement) { mouseDX += e.movementX; mouseDY += e.movementY; }
 });
 
+// Friction / gravity controls (buttons when the mouse is free, 1-4 keys while flying)
+const physVal = { friction: document.getElementById('frictionVal'), gravity: document.getElementById('gravityVal') };
+function showPhys() {
+  physVal.friction.textContent = phys.friction.toFixed(1);
+  physVal.gravity.textContent = phys.gravity.toFixed(1) + ' g';
+}
+function changePhys(p, d) { phys[p] = Math.round(THREE.MathUtils.clamp(phys[p] + d, 0, 5) * 10) / 10; showPhys(); }
+document.querySelectorAll('#physics button').forEach(b =>
+  b.addEventListener('click', e => { e.stopPropagation(); changePhys(b.dataset.p, +b.dataset.d); b.blur(); }));
+addEventListener('keydown', e => {
+  const map = { Digit1: ['friction', -0.1], Digit2: ['friction', 0.1], Digit3: ['gravity', -0.1], Digit4: ['gravity', 0.1] };
+  if (map[e.code]) changePhys(...map[e.code]);
+});
+showPhys();
+
 // ---------- HUD ----------
 const $ = id => document.getElementById(id);
-const hud = { stars: $('stars'), spd: $('spd'), alt: $('alt'), lap: $('lap'), fill: $('boostFill'), flash: $('flash'), drift: $('drift') };
+const hud = { stars: $('stars'), spd: $('spd'), alt: $('alt'), lap: $('lap'), fill: $('boostFill'), flash: $('flash'), drift: $('drift'), tod: $('tod') };
 let flashT = 0;
 
 // ---------- Audio (everything synthesized with Web Audio, no files) ----------
@@ -447,10 +615,14 @@ function update(dt, time) {
   yawRate += (yaw / Math.max(dt, 1e-4) - yawRate) * (1 - Math.exp(-8 * dt));
   nose.copy(f).multiplyScalar(Math.cos(pitch)).addScaledVector(up, Math.sin(pitch));
 
-  // Thrust along the nose. No speed cap: holding W accelerates forever.
+  // Thrust along the nose
   if (thrust) vel.addScaledVector(nose, ACCEL * dt);
   if (reverse) vel.addScaledVector(nose, -REVERSE_ACCEL * dt);
   if (boosting) vel.addScaledVector(nose, BOOST_ACCEL * dt);
+
+  // Gravity pulls toward the planet center; friction is air drag (slows every direction equally)
+  vel.addScaledVector(up, -phys.gravity * G_SCALE * dt);
+  vel.multiplyScalar(Math.exp(-phys.friction * DRAG_SCALE * dt));
 
   // Brake: intense, works on the whole velocity (whatever direction you're sliding)
   if (braking) {
@@ -459,7 +631,7 @@ function update(dt, time) {
     vel.multiplyScalar(sp > 0 ? ns / sp : 0);
   }
 
-  // Move along the sphere: no gravity, but "level" flight follows the curvature,
+  // Move along the sphere: "level" flight follows the curvature,
   // so flying straight takes you around the planet forever.
   const vr = vel.dot(up);
   _vt.copy(vel).addScaledVector(up, -vr);
@@ -472,9 +644,13 @@ function update(dt, time) {
   vel.applyQuaternion(_tq); f.applyQuaternion(_tq); nose.applyQuaternion(_tq); camN.applyQuaternion(_tq);
   pos.copy(_np); up = newUp;
 
-  // Altitude bounds (soft bounce)
+  // Ground (ocean or island) + ceiling: bounce a little on hard hits, otherwise skim
+  const ground = groundHeight(up);
   const alt = pos.length() - R;
-  if (alt < MIN_ALT) { pos.setLength(R + MIN_ALT); const v = vel.dot(up); if (v < 0) vel.addScaledVector(up, -1.5 * v); }
+  if (alt < ground + MIN_ALT) {
+    pos.setLength(R + ground + MIN_ALT);
+    const v = vel.dot(up); if (v < 0) vel.addScaledVector(up, -v * (v < -15 ? 1.35 : 1));
+  }
   if (alt > MAX_ALT) { pos.setLength(R + MAX_ALT); const v = vel.dot(up); if (v > 0) vel.addScaledVector(up, -1.5 * v); }
   f.addScaledVector(up, -f.dot(up)).normalize();
   nose.copy(f).multiplyScalar(Math.cos(pitch)).addScaledVector(up, Math.sin(pitch));
@@ -515,6 +691,8 @@ function update(dt, time) {
   camera.lookAt(_p.copy(pos).addScaledVector(camN, 15).addScaledVector(_camUp, 2));
   const fov = boosting ? 88 : 70 + Math.min(speed / 100, 15);
   camera.fov += (fov - camera.fov) * (1 - Math.exp(-4 * dt)); camera.updateProjectionMatrix();
+
+  updateSky(dt);
 
   // Stars: spin + collect (segment test so you can't tunnel through at huge speeds)
   _seg.set(_prev, pos);
